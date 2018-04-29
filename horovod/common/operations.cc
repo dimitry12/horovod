@@ -1217,9 +1217,6 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
   // The coordinator sends a SHUTDOWN message to trigger shutdown.
   bool should_shut_down = false;
   do {
-    // This delay determines thread frequency and MPI message latency
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-
     // Copy the data structures from global state under this lock.
     // However, don't keep the lock for the rest of the loop, so that
     // enqueued stream callbacks can continue.
@@ -1284,14 +1281,14 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
         if (msg_length == 0) {
           completed_ranks++;
           MPI_Recv(NULL, 0, MPI_BYTE, source_rank, TAG_NOTIFY, MPI_COMM_WORLD,
-                   &status);
+                   MPI_STATUS_IGNORE);
           continue;
         }
 
         // Get tensor name from MPI into an std::string.
         char* buffer = new char[msg_length];
         MPI_Recv(buffer, msg_length, MPI_BYTE, source_rank, TAG_NOTIFY,
-                 MPI_COMM_WORLD, &status);
+                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         std::string received_data(buffer, (size_t)msg_length);
         delete[] buffer;
 
@@ -1363,14 +1360,20 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
         // Notify all nodes which tensors we'd like to reduce at this step.
         std::string encoded_response;
         MPIResponse::SerializeToString(response, encoded_response);
+        auto tensor_list_isend_reqs = new MPI_Request[size - 1]();
         for (int r = 1; r < size; r++) {
-          MPI_Send(encoded_response.c_str(), (int)encoded_response.length() + 1,
-                   MPI_BYTE, r, TAG_NOTIFY, MPI_COMM_WORLD);
+          MPI_Isend(encoded_response.c_str(),
+                    (int)encoded_response.length() + 1, MPI_BYTE, r, TAG_NOTIFY,
+                    MPI_COMM_WORLD, &tensor_list_isend_reqs[r - 1]);
         }
 
         // Perform the collective operation. All nodes should end up performing
         // the same operation.
         PerformOperation(state.tensor_table, response);
+
+        // Clean up MPI_Isend requests.
+        MPI_Waitall(size - 1, tensor_list_isend_reqs, MPI_STATUSES_IGNORE);
+        delete[] tensor_list_isend_reqs;
       }
 
       // Notify all nodes that we are done with the reductions for this tick.
@@ -1380,9 +1383,11 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
                                                        : MPIResponse::DONE);
       std::string encoded_response;
       MPIResponse::SerializeToString(done_response, encoded_response);
+      auto done_isend_reqs = new MPI_Request[size - 1]();
       for (int r = 1; r < size; r++) {
-        MPI_Send(encoded_response.c_str(), (int)encoded_response.length() + 1,
-                 MPI_BYTE, r, TAG_NOTIFY, MPI_COMM_WORLD);
+        MPI_Isend(encoded_response.c_str(), (int)encoded_response.length() + 1,
+                  MPI_BYTE, r, TAG_NOTIFY, MPI_COMM_WORLD,
+                  &done_isend_reqs[r - 1]);
       }
 
       // Check for stalled tensors.
@@ -1391,6 +1396,10 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
         CheckForStalledTensors(state);
         state.last_stall_check = std::chrono::steady_clock::now();
       }
+
+      // Clean up MPI_Isend requests.
+      MPI_Waitall(size - 1, done_isend_reqs, MPI_STATUSES_IGNORE);
+      delete[] done_isend_reqs;
     } else {
       if (state.shut_down) {
         // Send a SHUTDOWN request to the coordinator.
@@ -1404,7 +1413,9 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
 
       // Notify the coordinator that this node is done sending messages.
       // A DONE message is encoded as a zero-length message.
-      MPI_Send(NULL, 0, MPI_BYTE, RANK_ZERO, TAG_NOTIFY, MPI_COMM_WORLD);
+      MPI_Request done_isend_req;
+      MPI_Isend(NULL, 0, MPI_BYTE, RANK_ZERO, TAG_NOTIFY, MPI_COMM_WORLD,
+                &done_isend_req);
 
       // Receive names for tensors to reduce from rank zero.
       // Once we receive a empty DONE message, stop waiting for more names.
@@ -1419,7 +1430,7 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
         // Get tensor name from MPI into an std::string.
         char* buffer = new char[msg_length];
         MPI_Recv(buffer, msg_length, MPI_BYTE, 0, TAG_NOTIFY, MPI_COMM_WORLD,
-                 &status);
+                 MPI_STATUS_IGNORE);
         std::string received_message(buffer, (size_t)msg_length);
         delete[] buffer;
 
@@ -1438,6 +1449,9 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
           PerformOperation(state.tensor_table, response);
         }
       }
+
+      // Clean up MPI_Isend request.
+      MPI_Wait(&done_isend_req, MPI_STATUS_IGNORE);
     }
   } while (!should_shut_down);
 
