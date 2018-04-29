@@ -139,6 +139,16 @@ struct HorovodGlobalState {
   // threshold will be fused.
   int64_t tensor_fusion_threshold = 64 * 1024 * 1024;
 
+  // Timeout for Tensor Fusion.  Force reduce of an incomplete buffer after
+  // this amount of time has passed.
+  int64_t tensor_fusion_timeout_millis = 5;
+
+  // Time point when last operation happened.
+  std::chrono::steady_clock::time_point last_operation_performed;
+
+  // Queue of coordinator responses.
+  std::deque<MPIResponse> coordinator_responses;
+
   // Memory buffers for Tensor Fusion.  They are keyed off device ID and
   // framework, and all are allocated tensor_fusion_threshold bytes if
   // initialized.
@@ -1214,6 +1224,12 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
     state.tensor_fusion_threshold = std::atol(horovod_fusion_threshold);
   }
 
+  // Override Tensor Fusion timeout, if it's set.
+  auto horovod_fusion_timeout = std::getenv("HOROVOD_FUSION_TIMEOUT");
+  if (horovod_fusion_timeout != nullptr) {
+    state.tensor_fusion_timeout_millis = std::atol(horovod_fusion_timeout);
+  }
+
   // Initialize the tensor count table. No tensors are available yet.
   if (is_coordinator) {
     state.message_table = std::unique_ptr<MessageTable>(new MessageTable());
@@ -1320,46 +1336,59 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
       // to rank zero. We can now do reductions and gathers; rank zero will
       // choose which ones and in what order, and will notify the other ranks
       // before doing each reduction.
-      std::vector<MPIResponse> responses;
       for (auto it = ready_to_reduce.begin(); it != ready_to_reduce.end();
            it++) {
         MPIResponse response = ConstructMPIResponse(state.message_table, *it);
-        responses.push_back(std::move(response));
+        state.coordinator_responses.push_back(std::move(response));
       }
 
-      while (!responses.empty()) {
-        auto it = responses.begin();
-        MPIResponse response = *it;
-        assert(response.tensor_names().size() == 1);
-        it = responses.erase(it);
+      while (!state.coordinator_responses.empty()) {
+        bool fusion_buffer_full = false;
+        auto response = state.coordinator_responses.front();
+        state.coordinator_responses.pop_front();
 
         if (response.response_type() == MPIResponse::ResponseType::ALLREDUCE) {
           // Attempt to add more responses to this fused response.
           auto& entry = state.tensor_table[response.tensor_names()[0]];
           int64_t tensor_size = entry.tensor->size();
 
-          while (it != responses.end()) {
-            assert(it->tensor_names().size() == 1);
-            auto& new_entry = state.tensor_table[it->tensor_names()[0]];
+          while (!state.coordinator_responses.empty()) {
+            auto new_response = state.coordinator_responses.front();
+            assert(new_response.tensor_names().size() == 1);
+            auto& new_entry =
+                state.tensor_table[new_response.tensor_names()[0]];
             int64_t new_tensor_size = new_entry.tensor->size();
 
-            if (response.response_type() == it->response_type() &&
-                response.devices() == it->devices() &&
+            if (response.response_type() == new_response.response_type() &&
+                response.devices() == new_response.devices() &&
                 entry.tensor->dtype() == new_entry.tensor->dtype() &&
                 tensor_size + new_tensor_size <=
                     state.tensor_fusion_threshold) {
               // These tensors will fuse together well.
               tensor_size += new_tensor_size;
-              response.add_tensor_names(it->tensor_names()[0]);
-              it = responses.erase(it);
+              response.add_tensor_names(new_response.tensor_names()[0]);
+              state.coordinator_responses.pop_front();
             } else {
               // Don't try to fuse additional tensors since they are usually
               // computed in order of requests and skipping tensors may mean
               // that the batch will have to wait longer while skipped tensors
               // could be reduced at that time.
+              fusion_buffer_full = true;
               break;
             }
           }
+        } else {
+          // Don't attempt to fuse these responses.
+          fusion_buffer_full = true;
+        }
+
+        if (!fusion_buffer_full &&
+            std::chrono::steady_clock::now() - state.last_operation_performed <
+                std::chrono::milliseconds(state.tensor_fusion_timeout_millis)) {
+          // Return half-fused response to the beginning of the response queue
+          // and finish the cycle.
+          state.coordinator_responses.push_front(response);
+          break;
         }
 
         // Notify all nodes which tensors we'd like to reduce at this step.
@@ -1375,6 +1404,9 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
         // Perform the collective operation. All nodes should end up performing
         // the same operation.
         PerformOperation(state.tensor_table, response);
+
+        // Update last operation time.
+        state.last_operation_performed = std::chrono::steady_clock::now();
 
         // Clean up MPI_Isend requests.
         MPI_Waitall(size - 1, tensor_list_isend_reqs, MPI_STATUSES_IGNORE);
@@ -1485,6 +1517,7 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
     while (!state.message_queue.empty()) {
       state.message_queue.pop();
     }
+    state.coordinator_responses.clear();
   }
   for (auto it = callbacks.begin(); it != callbacks.end(); it++) {
     (*it)(SHUT_DOWN_ERROR);
